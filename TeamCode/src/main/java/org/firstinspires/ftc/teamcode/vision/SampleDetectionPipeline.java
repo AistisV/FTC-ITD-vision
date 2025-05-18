@@ -14,6 +14,7 @@ import org.opencv.core.Mat;
 import org.opencv.core.MatOfPoint;
 import org.opencv.core.MatOfPoint2f;
 import org.opencv.core.Point;
+import org.opencv.core.Point3;
 import org.opencv.core.RotatedRect;
 import org.opencv.core.Scalar;
 import org.opencv.core.Size;
@@ -39,7 +40,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         SelectedColor color;
         RotatedRect rotatedRect;
         Point centroid;
-        Point distortedCentroid;
+        Point3 worldCentroid;
     }
 
     // Image buffers
@@ -55,8 +56,14 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
     Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
 
+    // Camera parameters
     Mat cameraMatrix = new Mat(3, 3, CvType.CV_64FC1);
     Mat distCoeffs = new Mat(1, 5, CvType.CV_64FC1);
+    public double cameraHeight = 26.7; // Height above the ground plane in CM
+    public double cameraDownAngle = 42; // Angle in degrees the camera points downwards
+
+    // Block height
+    private final double blockHeight = 4; // In CM
 
     // Threshold values
 //    public int YELLOW_MASK_THRESHOLD = 75;
@@ -147,9 +154,11 @@ public class SampleDetectionPipeline implements VisionProcessor {
         ArrayList<AnalyzedSample> detectedSamples = new ArrayList<>();
         findContours(frame, detectedSamples);
 
+        calculateWorldCentroids(detectedSamples);
+
 //        Imgproc.cvtColor(ycrcbMat, ycrcbMat, Imgproc.COLOR_YCrCb2RGB);
 //        ycrcbMat.copyTo(frame);
-        maskedColor.copyTo(frame);
+        cannyMat.copyTo(frame);
 //        tempUndistortedFrame.release();
 
         telemetry.update();
@@ -183,7 +192,6 @@ public class SampleDetectionPipeline implements VisionProcessor {
         Core.bitwise_and(input, input, maskedColor, morphedThreshold);
         Imgproc.Canny(maskedColor, cannyMat, 100, 250);
         Imgproc.dilate(cannyMat, cannyMat, kernel, new Point(-1, -1), 1);
-//        Imgproc.morphologyEx(cannyMat, cannyMat, Imgproc.MORPH_OPEN, kernel, new Point(-1, -1), 0);
 
         ArrayList<MatOfPoint> contoursList = new ArrayList<>();
         Imgproc.findContours(cannyMat, contoursList, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
@@ -203,36 +211,64 @@ public class SampleDetectionPipeline implements VisionProcessor {
         Moments moments = Imgproc.moments(contour);
         Point centroid = new Point(moments.m10 / moments.m00, moments.m01 / moments.m00);
 
-        // Undistort the centroid
-        Point undistortedCentroid = undistortPoint(centroid);
-
         // Fit rotated rectangle
         MatOfPoint2f contour2f = new MatOfPoint2f(contour.toArray());
-        RotatedRect rotatedRect = Imgproc.minAreaRect(contour2f);
+        RotatedRect distortedRotatedRect = Imgproc.minAreaRect(contour2f);
 
-        double angle = rotatedRect.angle;
-        // Adjust the angle based on rectangle dimensions and normalize to -90 to 90
-        if (rotatedRect.size.width < rotatedRect.size.height) {
-            angle += 90; // Rotate by 90 degrees if the rectangle more tall than wide
+        // Get the corner points of the *distorted* rotated rectangle
+        Point[] distortedPoints = new Point[4];
+        distortedRotatedRect.points(distortedPoints);
+
+        // Calculate the world coordinates of each corner
+        Point3[] worldCorners = new Point3[4];
+        for (int i = 0; i < 4; i++) {
+            worldCorners[i] = getWorldPosition(distortedPoints[i]);
         }
-        // Normalize angle to range -90 to 90
-        if (angle > 90) {
-            angle -= 180;
-        }
-        telemetry.addData("Angle", angle);
-        telemetry.addData("Undistorted Centroid X", undistortedCentroid.x);
-        telemetry.addData("Undistorted Centroid Y", undistortedCentroid.y);
+
+        // Calculate the orientation from the world corners
+        double angleWorld = calculateWorldAngle(worldCorners);
+        telemetry.addData("Angle (World)", angleWorld);
 
         AnalyzedSample sample = new AnalyzedSample();
-        sample.angle = angle;
+        sample.angle = angleWorld;
         sample.color = color;
-        sample.rotatedRect = rotatedRect;
-        sample.centroid = undistortedCentroid; // Store the undistorted centroid
-        sample.distortedCentroid = centroid;
+        sample.rotatedRect = distortedRotatedRect;
+        sample.centroid = centroid;
         outputList.add(sample);
 
         contour2f.release();
-//        approxCurve.release();
+    }
+
+    private double calculateWorldAngle(Point3[] corners) {
+        // Calculate the squared length of two adjacent sides
+        double lenSq01 = Math.pow(corners[1].x - corners[0].x, 2) + Math.pow(corners[1].y - corners[0].y, 2);
+        double lenSq12 = Math.pow(corners[2].x - corners[1].x, 2) + Math.pow(corners[2].y - corners[1].y, 2);
+
+        // Determine which side is longer and get its endpoints
+        Point3 p1, p2;
+        if (lenSq01 >= lenSq12) {
+            p1 = corners[0];
+            p2 = corners[1];
+        } else {
+            p1 = corners[1];
+            p2 = corners[2];
+        }
+
+        // Calculate the angle of this longer side
+        double deltaX = p2.x - p1.x;
+        double deltaY = p2.y - p1.y;
+        double angleRadians = Math.atan2(deltaY, deltaX);
+        double angleDegrees = Math.toDegrees(angleRadians);
+
+        // Normalize to 0-180
+        if (angleDegrees < 0) {
+            angleDegrees += 360;
+        }
+        if (angleDegrees > 180) {
+            angleDegrees -= 180;
+        }
+
+        return angleDegrees;
     }
 
     boolean filterContour(MatOfPoint contour){
@@ -249,6 +285,110 @@ public class SampleDetectionPipeline implements VisionProcessor {
         return (aspectRatio <= MAX_ASPECT_RATIO && aspectRatioInv <= MAX_ASPECT_RATIO);
     }
 
+    private void calculateWorldCentroids(ArrayList<AnalyzedSample> detectedSamples) {
+        for (AnalyzedSample sample : detectedSamples) {
+            sample.worldCentroid = getWorldPosition(sample.centroid);
+            telemetry.addData("World Centroid X", sample.worldCentroid.x);
+            telemetry.addData("World Centroid Y", sample.worldCentroid.y);
+        }
+    }
+
+    Point3 getWorldPosition(Point imagePoint) {
+        // 1. Undistort and normalize
+        Point undistortedPoint = undistortPoint(imagePoint);
+        double x_n = (undistortedPoint.x - cameraMatrix.get(0, 2)[0]) / cameraMatrix.get(0, 0)[0];
+        double y_n = (undistortedPoint.y - cameraMatrix.get(1, 2)[0]) / cameraMatrix.get(1, 1)[0];
+        Point3 rayDirectionCamera = new Point3(x_n, y_n, 1);
+
+        // 2. World ray direction
+        double angleRadians = Math.toRadians(cameraDownAngle);
+        Mat cameraRotationMatrix = new Mat(3, 3, CvType.CV_64FC1);
+        double[] rotationData = {1, 0, 0, 0, Math.cos(angleRadians), -Math.sin(angleRadians), 0, Math.sin(angleRadians), Math.cos(angleRadians)};
+        cameraRotationMatrix.put(0, 0, rotationData);
+        Point3 rayDirectionWorld = transformDirectionToWorld(rayDirectionCamera, cameraRotationMatrix);
+        cameraRotationMatrix.release();
+
+        // 3. Camera origin
+        Point3 rayOriginWorld = new Point3(0, 0, cameraHeight);
+
+        // 4. Calculate 't' for intersection with the ground plane (Z=0)
+        double t = (0 - rayOriginWorld.z) / rayDirectionWorld.z;
+
+        // 5. Calculate the 3D position of the intersection point on the ground
+        Point3 intersectionPointWorld = new Point3(
+                rayOriginWorld.x + rayDirectionWorld.x * t,
+                rayOriginWorld.y + rayDirectionWorld.y * t,
+                0
+        );
+
+        return intersectionPointWorld;
+    }
+
+//    Point3 estimateBasePosition(Point undistortedCentroid) {
+//        // 1. Undistort centroid and normalize coordinates
+//        double x_n = (undistortedCentroid.x - cameraMatrix.get(0, 2)[0]) / cameraMatrix.get(0, 0)[0];
+//        double y_n = (undistortedCentroid.y - cameraMatrix.get(1, 2)[0]) / cameraMatrix.get(1, 1)[0];
+//        Point3 rayDirectionCamera = new Point3(x_n, y_n, 1);
+//
+//        // 2. Calculate ray direction in world coordinates
+//        double angleRadians = Math.toRadians(cameraDownAngle);
+//        Mat cameraRotationMatrix = new Mat(3, 3, CvType.CV_64FC1);
+//        cameraRotationMatrix.put(0, 0, 1);
+//        cameraRotationMatrix.put(0, 1, 0);
+//        cameraRotationMatrix.put(0, 2, 0);
+//        cameraRotationMatrix.put(1, 0, 0);
+//        cameraRotationMatrix.put(1, 1, Math.cos(angleRadians));
+//        cameraRotationMatrix.put(1, 2, -Math.sin(angleRadians));
+//        cameraRotationMatrix.put(2, 0, 0);
+//        cameraRotationMatrix.put(2, 1, Math.sin(angleRadians));
+//        cameraRotationMatrix.put(2, 2, Math.cos(angleRadians));
+//        Point3 rayDirectionWorld = transformDirectionToWorld(rayDirectionCamera, cameraRotationMatrix);
+//
+//        // Camera position in world coordinates
+//        Point3 rayOriginWorld = new Point3(0, 0, cameraHeight);
+//
+//        // 3. Approximate the world Z-coordinate of the centroid
+////        double centroidHeightWorld = blockHeight / 2.0;
+//        double centroidHeightWorld = blockHeight;
+//
+//        // 4. Calculate the 't' parameter to reach the centroid's height along the ray
+//        double t_centroidHeight = (centroidHeightWorld - rayOriginWorld.z) / rayDirectionWorld.z;
+//
+//        // 5. Calculate the 3D position of the centroid in world coordinates
+//        Point3 centroidWorld = new Point3(
+//                rayOriginWorld.x + rayDirectionWorld.x * t_centroidHeight,
+//                rayOriginWorld.y + rayDirectionWorld.y * t_centroidHeight,
+//                centroidHeightWorld // Z-coordinate is our approximated centroid height
+//        );
+//
+//        // 6. Project the base of the block (which is 'blockHeight / 2' below the centroid) onto the ground plane
+//        // We move along the inverse of the ray direction from the centroid's world position
+//        double t_toBase = -(blockHeight / 2.0) / rayDirectionWorld.z;
+//        Point3 blockBasePosition = new Point3(
+//                centroidWorld.x + rayDirectionWorld.x * t_toBase,
+//                centroidWorld.y + rayDirectionWorld.y * t_toBase,
+//                0 // Project onto the ground plane (Z = 0)
+//        );
+//
+//        return blockBasePosition;
+//    }
+
+    Point3 transformDirectionToWorld(Point3 rayDirectionCamera, Mat cameraRotation) {
+        Mat rayDirectionCameraMat = new Mat(3, 1, CvType.CV_64FC1);
+        rayDirectionCameraMat.put(0, 0, rayDirectionCamera.x);
+        rayDirectionCameraMat.put(1, 0, rayDirectionCamera.y);
+        rayDirectionCameraMat.put(2, 0, rayDirectionCamera.z);
+
+        Mat rayDirectionWorldMat = new Mat(3, 1, CvType.CV_64FC1);
+        Core.gemm(cameraRotation, rayDirectionCameraMat, 1.0, new Mat(), 0.0, rayDirectionWorldMat, 0);
+
+        return new Point3(
+                rayDirectionWorldMat.get(0, 0)[0],
+                rayDirectionWorldMat.get(1, 0)[0],
+                rayDirectionWorldMat.get(2, 0)[0]
+        );
+    }
+
     @SuppressWarnings("unchecked")
     @Override
     public void onDrawFrame(Canvas canvas, int onscreenWidth, int onscreenHeight, float scaleBmpPxToCanvasPx, float scaleCanvasDensity, Object userContext) {
@@ -258,65 +398,40 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
         ArrayList<AnalyzedSample> samplesToDraw = (ArrayList<AnalyzedSample>) userContext;
 
-        Paint paint = new Paint();
-        paint.setColor(Color.GREEN);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(scaleCanvasDensity * 4);
+        Paint distortedPaint = new Paint();
+        distortedPaint.setColor(Color.RED);
+        distortedPaint.setStyle(Paint.Style.STROKE);
+        distortedPaint.setStrokeWidth(scaleCanvasDensity * 2);
 
         Paint centerPaint = new Paint();
         centerPaint.setColor(Color.YELLOW);
         centerPaint.setStyle(Paint.Style.FILL);
         centerPaint.setStrokeWidth(scaleCanvasDensity * 2);
 
-        Paint undistortedCenterPaint = new Paint();
-        undistortedCenterPaint.setColor(Color.BLUE);
-        undistortedCenterPaint.setStyle(Paint.Style.FILL);
-        undistortedCenterPaint.setStrokeWidth(scaleCanvasDensity * 2);
-
         for (AnalyzedSample sample : samplesToDraw) {
-            RotatedRect rotatedRect = sample.rotatedRect;
-            Point[] points = new Point[4];
-            rotatedRect.points(points);
+            // Draw the distorted rectangle
+            RotatedRect distortedRect = sample.rotatedRect;
+            Point[] distortedPoints = new Point[4];
+            distortedRect.points(distortedPoints);
 
             for (int i = 0; i < 4; ++i) {
                 canvas.drawLine(
-                        (float) (points[i].x * scaleBmpPxToCanvasPx),
-                        (float) (points[i].y * scaleBmpPxToCanvasPx),
-                        (float) (points[(i + 1) % 4].x * scaleBmpPxToCanvasPx),
-                        (float) (points[(i + 1) % 4].y * scaleBmpPxToCanvasPx),
-                        paint
+                        (float) (distortedPoints[i].x * scaleBmpPxToCanvasPx),
+                        (float) (distortedPoints[i].y * scaleBmpPxToCanvasPx),
+                        (float) (distortedPoints[(i + 1) % 4].x * scaleBmpPxToCanvasPx),
+                        (float) (distortedPoints[(i + 1) % 4].y * scaleBmpPxToCanvasPx),
+                        distortedPaint
                 );
             }
-            // Draw a small circle at the center
+
+            // Draw a small circle at the centroid
             canvas.drawCircle(
                     (float) (sample.centroid.x * scaleBmpPxToCanvasPx),
                     (float) (sample.centroid.y * scaleBmpPxToCanvasPx),
-                    5 * scaleCanvasDensity, // Adjust radius as needed
+                    5 * scaleCanvasDensity,
                     centerPaint
             );
-//            // Undistort the rectangle's center for visualization
-//            Point undistortedRectCenter = undistortPoint(rotatedRect.center);
-//
-//            // Draw the undistorted center
-//            if (undistortedRectCenter != null) {
-//                canvas.drawCircle(
-//                        (float) (undistortedRectCenter.x * scaleBmpPxToCanvasPx),
-//                        (float) (undistortedRectCenter.y * scaleBmpPxToCanvasPx),
-//                        7 * scaleCanvasDensity,
-//                        undistortedCenterPaint
-//                );
-//            }
-            // Draw a small circle at the undistorted centroid
-            if (sample.centroid != null) {
-                canvas.drawCircle(
-                        (float) (sample.distortedCentroid.x * scaleBmpPxToCanvasPx),
-                        (float) (sample.distortedCentroid.y * scaleBmpPxToCanvasPx),
-                        7 * scaleCanvasDensity,
-                        undistortedCenterPaint
-                );
-            }
         }
-
     }
 
 }
