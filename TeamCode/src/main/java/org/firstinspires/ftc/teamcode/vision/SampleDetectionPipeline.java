@@ -67,15 +67,12 @@ public class SampleDetectionPipeline implements VisionProcessor {
     private final double blockHeight = 4; // In CM
 
     // Threshold values
-//    public int YELLOW_MASK_THRESHOLD = 75;
-//    public int BLUE_MASK_THRESHOLD = 150;
-//    public int RED_MASK_THRESHOLD = 195;
     public Scalar redLower = new Scalar(0, 170, 90); // Can change second and third
     public Scalar redUpper = new Scalar(255, 255, 255);
     public Scalar yellowLower = new Scalar(0, 145, 0); // Can change second
     public Scalar yellowUpper = new Scalar(255, 255, 85); // Can change third
     public Scalar blueLower = new Scalar(0, 80, 150); // Can change third
-    public Scalar blueUpper = new Scalar(255, 255, 255); // Can change first
+    public Scalar blueUpper = new Scalar(255, 255, 255);
 
     public double MIN_AREA = 1000;
     public double MAX_AREA = 15000;
@@ -87,7 +84,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
     private final int CALIBRATION_WIDTH = 2560;
     private final int CALIBRATION_HEIGHT = 1440;
 
-    SelectedColor selectedColor = SelectedColor.BLUE;
+    SelectedColor selectedColor = SelectedColor.RED;
 
     Telemetry telemetry = null;
 
@@ -126,7 +123,6 @@ public class SampleDetectionPipeline implements VisionProcessor {
         src.release();
         dst.release();
 
-        // Perform the projection to get pixel coordinates
         double fx = cameraMatrix.get(0, 0)[0];
         double fy = cameraMatrix.get(1, 1)[0];
         double cx = cameraMatrix.get(0, 2)[0];
@@ -197,7 +193,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         ArrayList<MatOfPoint> contoursList = new ArrayList<>();
         Imgproc.findContours(cannyMat, contoursList, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
 
-        telemetry.addData("Contours", contoursList.size());
+//        telemetry.addData("Contours", contoursList.size());
 
         for (MatOfPoint contour : contoursList) {
             if (!filterContour(contour)) continue;
@@ -216,7 +212,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         MatOfPoint2f contour2f = new MatOfPoint2f(contour.toArray());
         RotatedRect distortedRotatedRect = Imgproc.minAreaRect(contour2f);
 
-        // Get the corner points of the *distorted* rotated rectangle
+        // Get the corner points of the "distorted" rotated rectangle
         Point[] distortedPoints = new Point[4];
         distortedRotatedRect.points(distortedPoints);
 
@@ -241,11 +237,10 @@ public class SampleDetectionPipeline implements VisionProcessor {
     }
 
     private double calculateWorldAngle(Point3[] corners) {
-        // Calculate the squared length of two adjacent sides
+        // Calculate the squared length of two adjacent sides (to avoid sqrt)
         double lenSq01 = Math.pow(corners[1].x - corners[0].x, 2) + Math.pow(corners[1].y - corners[0].y, 2);
         double lenSq12 = Math.pow(corners[2].x - corners[1].x, 2) + Math.pow(corners[2].y - corners[1].y, 2);
 
-        // Determine which side is longer and get its endpoints
         Point3 p1, p2;
         if (lenSq01 >= lenSq12) {
             p1 = corners[0];
@@ -255,7 +250,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
             p2 = corners[2];
         }
 
-        // Calculate the angle of this longer side
+        // Calculate the angle of the longer side
         double deltaX = p2.x - p1.x;
         double deltaY = p2.y - p1.y;
         double angleRadians = Math.atan2(deltaY, deltaX);
@@ -295,13 +290,13 @@ public class SampleDetectionPipeline implements VisionProcessor {
     }
 
     Point3 getWorldPosition(Point imagePoint) {
-        // 1. Undistort and normalize
+        // Undistort and normalize
         Point undistortedPoint = undistortPoint(imagePoint);
         double x_n = (undistortedPoint.x - cameraMatrix.get(0, 2)[0]) / cameraMatrix.get(0, 0)[0];
         double y_n = (undistortedPoint.y - cameraMatrix.get(1, 2)[0]) / cameraMatrix.get(1, 1)[0];
         Point3 rayDirectionCamera = new Point3(x_n, y_n, 1);
 
-        // 2. World ray direction
+        // World ray direction
         double angleRadians = Math.toRadians(cameraDownAngle);
         Mat cameraRotationMatrix = new Mat(3, 3, CvType.CV_64FC1);
         double[] rotationData = {1, 0, 0, 0, Math.cos(angleRadians), -Math.sin(angleRadians), 0, Math.sin(angleRadians), Math.cos(angleRadians)};
@@ -309,13 +304,13 @@ public class SampleDetectionPipeline implements VisionProcessor {
         Point3 rayDirectionWorld = transformDirectionToWorld(rayDirectionCamera, cameraRotationMatrix);
         cameraRotationMatrix.release();
 
-        // 3. Camera origin
+        // Camera origin
         Point3 rayOriginWorld = new Point3(0, 0, cameraHeight);
 
-        // 4. Calculate 't' for intersection with the ground plane (Z=0)
+        // Calculate 't' for intersection with the ground plane (Z=0)
         double t = (0 - rayOriginWorld.z) / rayDirectionWorld.z;
 
-        // 5. Calculate the 3D position of the intersection point on the ground
+        // Calculate the 3D position of the intersection point on the ground
         Point3 intersectionPointWorld = new Point3(
                 rayOriginWorld.x + rayDirectionWorld.x * t,
                 rayOriginWorld.y + rayDirectionWorld.y * t,
@@ -324,55 +319,6 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
         return intersectionPointWorld;
     }
-
-//    Point3 estimateBasePosition(Point undistortedCentroid) {
-//        // 1. Undistort centroid and normalize coordinates
-//        double x_n = (undistortedCentroid.x - cameraMatrix.get(0, 2)[0]) / cameraMatrix.get(0, 0)[0];
-//        double y_n = (undistortedCentroid.y - cameraMatrix.get(1, 2)[0]) / cameraMatrix.get(1, 1)[0];
-//        Point3 rayDirectionCamera = new Point3(x_n, y_n, 1);
-//
-//        // 2. Calculate ray direction in world coordinates
-//        double angleRadians = Math.toRadians(cameraDownAngle);
-//        Mat cameraRotationMatrix = new Mat(3, 3, CvType.CV_64FC1);
-//        cameraRotationMatrix.put(0, 0, 1);
-//        cameraRotationMatrix.put(0, 1, 0);
-//        cameraRotationMatrix.put(0, 2, 0);
-//        cameraRotationMatrix.put(1, 0, 0);
-//        cameraRotationMatrix.put(1, 1, Math.cos(angleRadians));
-//        cameraRotationMatrix.put(1, 2, -Math.sin(angleRadians));
-//        cameraRotationMatrix.put(2, 0, 0);
-//        cameraRotationMatrix.put(2, 1, Math.sin(angleRadians));
-//        cameraRotationMatrix.put(2, 2, Math.cos(angleRadians));
-//        Point3 rayDirectionWorld = transformDirectionToWorld(rayDirectionCamera, cameraRotationMatrix);
-//
-//        // Camera position in world coordinates
-//        Point3 rayOriginWorld = new Point3(0, 0, cameraHeight);
-//
-//        // 3. Approximate the world Z-coordinate of the centroid
-////        double centroidHeightWorld = blockHeight / 2.0;
-//        double centroidHeightWorld = blockHeight;
-//
-//        // 4. Calculate the 't' parameter to reach the centroid's height along the ray
-//        double t_centroidHeight = (centroidHeightWorld - rayOriginWorld.z) / rayDirectionWorld.z;
-//
-//        // 5. Calculate the 3D position of the centroid in world coordinates
-//        Point3 centroidWorld = new Point3(
-//                rayOriginWorld.x + rayDirectionWorld.x * t_centroidHeight,
-//                rayOriginWorld.y + rayDirectionWorld.y * t_centroidHeight,
-//                centroidHeightWorld // Z-coordinate is our approximated centroid height
-//        );
-//
-//        // 6. Project the base of the block (which is 'blockHeight / 2' below the centroid) onto the ground plane
-//        // We move along the inverse of the ray direction from the centroid's world position
-//        double t_toBase = -(blockHeight / 2.0) / rayDirectionWorld.z;
-//        Point3 blockBasePosition = new Point3(
-//                centroidWorld.x + rayDirectionWorld.x * t_toBase,
-//                centroidWorld.y + rayDirectionWorld.y * t_toBase,
-//                0 // Project onto the ground plane (Z = 0)
-//        );
-//
-//        return blockBasePosition;
-//    }
 
     Point3 transformDirectionToWorld(Point3 rayDirectionCamera, Mat cameraRotation) {
         Mat rayDirectionCameraMat = new Mat(3, 1, CvType.CV_64FC1);
@@ -410,7 +356,6 @@ public class SampleDetectionPipeline implements VisionProcessor {
         centerPaint.setStrokeWidth(scaleCanvasDensity * 2);
 
         for (AnalyzedSample sample : samplesToDraw) {
-            // Draw the distorted rectangle
             RotatedRect distortedRect = sample.rotatedRect;
             Point[] distortedPoints = new Point[4];
             distortedRect.points(distortedPoints);
@@ -425,7 +370,6 @@ public class SampleDetectionPipeline implements VisionProcessor {
                 );
             }
 
-            // Draw a small circle at the centroid
             canvas.drawCircle(
                     (float) (sample.centroid.x * scaleBmpPxToCanvasPx),
                     (float) (sample.centroid.y * scaleBmpPxToCanvasPx),
