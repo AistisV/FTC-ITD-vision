@@ -50,9 +50,10 @@ public class SampleDetectionPipeline implements VisionProcessor {
     Mat cbMat = new Mat();
 
     Mat thresholdMat = new Mat();
-    Mat morphedThreshold = new Mat();
-    Mat maskedColor = new Mat();
+    Mat morphedThresholdMat = new Mat();
+    Mat maskedColorMat = new Mat();
     Mat cannyMat = new Mat();
+    Mat visualizationMat = new Mat();
 
     Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
 
@@ -86,7 +87,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
     private final int CALIBRATION_WIDTH = 2560;
     private final int CALIBRATION_HEIGHT = 1440;
 
-    SelectedColor selectedColor = SelectedColor.RED;
+    SelectedColor selectedColor = SelectedColor.BLUE;
 
     Telemetry telemetry = null;
 
@@ -149,17 +150,17 @@ public class SampleDetectionPipeline implements VisionProcessor {
     public Object processFrame(Mat frame, long captureTimeNanos) {
 //        Mat tempUndistortedFrame = new Mat();
         Imgproc.resize(frame, frame, new Size(WIDTH, HEIGHT));
+        visualizationMat = frame.clone();
 //        Calib3d.undistort(frame, tempUndistortedFrame, cameraMatrix, distCoeffs);
 
         ArrayList<AnalyzedSample> detectedSamples = new ArrayList<>();
         findContours(frame, detectedSamples);
-
         calculateWorldCentroids(detectedSamples);
 
-//        Imgproc.cvtColor(ycrcbMat, ycrcbMat, Imgproc.COLOR_YCrCb2RGB);
-//        ycrcbMat.copyTo(frame);
-        cannyMat.copyTo(frame);
-//        tempUndistortedFrame.release();
+        Core.multiply(visualizationMat, new Scalar(0.3, 0.3, 0.3), visualizationMat);
+        Core.addWeighted(visualizationMat, 0.7, maskedColorMat, 0.6, 0, visualizationMat);
+
+        visualizationMat.copyTo(frame);
 
         telemetry.update();
 
@@ -184,13 +185,13 @@ public class SampleDetectionPipeline implements VisionProcessor {
         }
 
         // Apply morphology for noise reduction
-        Imgproc.morphologyEx(thresholdMat, morphedThreshold, Imgproc.MORPH_CLOSE, kernel, new Point(-1, -1), 2);
-        Imgproc.morphologyEx(morphedThreshold, morphedThreshold, Imgproc.MORPH_OPEN, kernel, new Point(-1, -1), 1);
+        Imgproc.morphologyEx(thresholdMat, morphedThresholdMat, Imgproc.MORPH_CLOSE, kernel, new Point(-1, -1), 2);
+        Imgproc.morphologyEx(morphedThresholdMat, morphedThresholdMat, Imgproc.MORPH_OPEN, kernel, new Point(-1, -1), 1);
 
         // Canny edge detection
-        maskedColor.release();
-        Core.bitwise_and(input, input, maskedColor, morphedThreshold);
-        Imgproc.Canny(maskedColor, cannyMat, 100, 250);
+        maskedColorMat.release();
+        Core.bitwise_and(input, input, maskedColorMat, morphedThresholdMat);
+        Imgproc.Canny(maskedColorMat, cannyMat, 100, 250);
         Imgproc.dilate(cannyMat, cannyMat, kernel, new Point(-1, -1), 1);
 
         ArrayList<MatOfPoint> contoursList = new ArrayList<>();
