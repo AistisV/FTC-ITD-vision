@@ -22,6 +22,8 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.imgproc.Moments;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 
 public class SampleDetectionPipeline implements VisionProcessor {
 
@@ -41,6 +43,8 @@ public class SampleDetectionPipeline implements VisionProcessor {
         RotatedRect rotatedRect;
         Point centroid;
         Point3 worldCentroid;
+        Mat line1;
+        Mat line2;
     }
 
     // Image buffers
@@ -67,12 +71,15 @@ public class SampleDetectionPipeline implements VisionProcessor {
     private final double blockHeight = 4; // In CM
 
     // Threshold values
-    public Scalar redLower = new Scalar(0, 170, 90); // Can change second and third
+    public Scalar redLower = new Scalar(0, 180, 80); // Can change second and third
     public Scalar redUpper = new Scalar(255, 255, 255);
     public Scalar yellowLower = new Scalar(0, 145, 0); // Can change second
     public Scalar yellowUpper = new Scalar(255, 255, 85); // Can change third
     public Scalar blueLower = new Scalar(0, 80, 150); // Can change third
     public Scalar blueUpper = new Scalar(255, 255, 255);
+
+    public double minLengthForDirection = 5; // Adjust
+    public double dotProductTresh = 0.7;
 
     public double MIN_AREA = 1000;
     public double MAX_AREA = 15000;
@@ -146,17 +153,17 @@ public class SampleDetectionPipeline implements VisionProcessor {
     public Object processFrame(Mat frame, long captureTimeNanos) {
 //        Mat tempUndistortedFrame = new Mat();
         Imgproc.resize(frame, frame, new Size(WIDTH, HEIGHT));
-        visualizationMat = frame.clone();
+//        visualizationMat = frame.clone();
 //        Calib3d.undistort(frame, tempUndistortedFrame, cameraMatrix, distCoeffs);
 
         ArrayList<AnalyzedSample> detectedSamples = new ArrayList<>();
         findContours(frame, detectedSamples);
         calculateWorldCentroids(detectedSamples);
 
-        Core.multiply(visualizationMat, new Scalar(0.3, 0.3, 0.3), visualizationMat);
-        Core.addWeighted(visualizationMat, 0.7, maskedColorMat, 0.6, 0, visualizationMat);
+//        Core.multiply(visualizationMat, new Scalar(0.3, 0.3, 0.3), visualizationMat);
+//        Core.addWeighted(visualizationMat, 0.7, maskedColorMat, 0.6, 0, visualizationMat);
 
-        visualizationMat.copyTo(frame);
+        cannyMat.copyTo(frame);
 
         telemetry.update();
 
@@ -187,7 +194,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         // Canny edge detection
         maskedColorMat.release();
         Core.bitwise_and(input, input, maskedColorMat, morphedThresholdMat);
-        Imgproc.Canny(maskedColorMat, cannyMat, 100, 250);
+        Imgproc.Canny(maskedColorMat, cannyMat, 50, 200);
         Imgproc.dilate(cannyMat, cannyMat, kernel, new Point(-1, -1), 1);
 
         ArrayList<MatOfPoint> contoursList = new ArrayList<>();
@@ -203,7 +210,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
     }
 
-    void analyzeContour(MatOfPoint contour, SelectedColor color, ArrayList<AnalyzedSample> outputList){
+    void analyzeContour(MatOfPoint contour, SelectedColor color, ArrayList<AnalyzedSample> outputList) {
         // Calculate the centroid of the contour
         Moments moments = Imgproc.moments(contour);
         Point centroid = new Point(moments.m10 / moments.m00, moments.m01 / moments.m00);
@@ -211,15 +218,42 @@ public class SampleDetectionPipeline implements VisionProcessor {
         // Fit rotated rectangle
         MatOfPoint2f contour2f = new MatOfPoint2f(contour.toArray());
         RotatedRect distortedRotatedRect = Imgproc.minAreaRect(contour2f);
+        Point[] rotatedRectPoints = new Point[4];
+        distortedRotatedRect.points(rotatedRectPoints);
 
-        // Get the corner points of the "distorted" rotated rectangle
-        Point[] distortedPoints = new Point[4];
-        distortedRotatedRect.points(distortedPoints);
+        // Find the highest point on the contour
+        List<Point> points = contour.toList();
+        Point topPoint = null;
+        if (!points.isEmpty()) {
+            topPoint = points.stream().min(Comparator.comparingDouble(p -> p.y)).orElse(points.get(0));
+        }
+
+        if (topPoint == null) return; // Ensure there is a valid topPoint
+
+        ArrayList<Point> segment1 = getStraightSegment(points, topPoint, true); // Clockwise
+        ArrayList<Point> segment2 = getStraightSegment(points, topPoint, false); // Counter-clockwise
+        if (!(segment1.size() >= 2 && segment2.size() >= 2)) return;
+
+        MatOfPoint2f segment1Mat = new MatOfPoint2f(segment1.toArray(new Point[0]));
+        MatOfPoint2f segment2Mat = new MatOfPoint2f(segment2.toArray(new Point[0]));
+
+        Mat line1 = new Mat();
+        Imgproc.fitLine(segment1Mat, line1, Imgproc.DIST_L2, 0, 0.01, 0.01);
+
+        Mat line2 = new Mat();
+        Imgproc.fitLine(segment2Mat, line2, Imgproc.DIST_L2, 0, 0.01, 0.01);
+
+        telemetry.addData("Top Point", topPoint.toString());
+        telemetry.addData("Line 1", line1.dump());
+        telemetry.addData("Line 2", line2.dump());
+
+        segment1Mat.release();
+        segment2Mat.release();
 
         // Calculate the world coordinates of each corner
         Point3[] worldCorners = new Point3[4];
         for (int i = 0; i < 4; i++) {
-            worldCorners[i] = getWorldPosition(distortedPoints[i]);
+            worldCorners[i] = getWorldPosition(rotatedRectPoints[i]);
         }
 
         // Calculate the orientation from the world corners
@@ -231,9 +265,61 @@ public class SampleDetectionPipeline implements VisionProcessor {
         sample.color = color;
         sample.rotatedRect = distortedRotatedRect;
         sample.centroid = centroid;
+        sample.line1 = line1;
+        sample.line2 = line2;
         outputList.add(sample);
 
         contour2f.release();
+    }
+
+    private ArrayList<Point> getStraightSegment(List<Point> points, Point startPoint, boolean clockwise) {
+        ArrayList<Point> segment = new ArrayList<>();
+        int startIndex = points.indexOf(startPoint);
+        if (startIndex == -1) return segment;
+
+        segment.add(startPoint);
+        Point prevPoint = startPoint;
+        Point currentPoint;
+        Vec2f overallDirection;
+        int segmentLength = 0;
+
+        for (int i = 1; i < points.size(); i++) {
+            int index = (startIndex + (clockwise ? i : -i) + points.size()) % points.size();
+            currentPoint = points.get(index);
+            segment.add(currentPoint);
+            segmentLength++;
+
+            if (segmentLength > minLengthForDirection) {
+                // Update overall direction
+                overallDirection = new Vec2f((float) (currentPoint.x - startPoint.x), (float) (currentPoint.y - startPoint.y));
+                Core.normalize(overallDirection, overallDirection);
+
+                if (segmentLength > 2) {
+                    Vec2f currentDirection = new Vec2f((float) (currentPoint.x - prevPoint.x), (float) (currentPoint.y - prevPoint.y));
+                    Core.normalize(currentDirection, currentDirection);
+
+                    double dotProduct = overallDirection.dot(currentDirection);
+                    // If dot product is significantly less than 1 (angle is large), stop
+                    if (dotProduct < dotProductTresh) { // Adjust threshold
+                        segment.remove(currentPoint); // Remove the point where direction changed
+                        break;
+                    }
+                }
+            }
+            prevPoint = currentPoint;
+        }
+        return segment;
+    }
+
+    private static class Vec2f extends Mat {
+        public Vec2f(float x, float y) {
+            super(2, 1, CvType.CV_32FC1);
+            put(0, 0, x);
+            put(1, 0, y);
+        }
+        public float dot(Vec2f other) {
+            return (float)(get(0, 0)[0] * other.get(0, 0)[0] + get(1, 0)[0] * other.get(1, 0)[0]);
+        }
     }
 
     private double calculateWorldAngle(Point3[] corners) {
@@ -355,6 +441,10 @@ public class SampleDetectionPipeline implements VisionProcessor {
         centerPaint.setStyle(Paint.Style.FILL);
         centerPaint.setStrokeWidth(scaleCanvasDensity * 2);
 
+        Paint linePaint = new Paint();
+        linePaint.setColor(Color.GREEN); // Or any color you prefer
+        linePaint.setStrokeWidth(scaleCanvasDensity * 3);
+
         for (AnalyzedSample sample : samplesToDraw) {
             RotatedRect distortedRect = sample.rotatedRect;
             Point[] distortedPoints = new Point[4];
@@ -376,6 +466,45 @@ public class SampleDetectionPipeline implements VisionProcessor {
                     5 * scaleCanvasDensity,
                     centerPaint
             );
+//            sample.line1 = new Mat(4, 1, CvType.CV_32FC1);
+//            sample.line1.put(0, 0, 1.0); // vx
+//            sample.line1.put(1, 0, 0.0); // vy
+//            sample.line1.put(2, 0, onscreenWidth / 2.0); // x0
+//            sample.line1.put(3, 0, onscreenHeight / 2.0); // y0
+//
+//            sample.line2 = new Mat(4, 1, CvType.CV_32FC1);
+//            sample.line2.put(0, 0, 0.0); // vx
+//            sample.line2.put(1, 0, 1.0); // vy
+//            sample.line2.put(2, 0, onscreenWidth / 2.0); // x0
+//            sample.line2.put(3, 0, onscreenHeight / 2.0); // y0
+            // Draw the fitted lines if they exist
+            if (sample.line1 != null && sample.line1.rows() > 0 && sample.line1.cols() > 0 && sample.line1.total() == 4 &&
+                    sample.line2 != null && sample.line2.rows() > 0 && sample.line2.cols() > 0 && sample.line2.total() == 4) {
+
+                // Line 1
+                float vx1 = (float) sample.line1.get(0, 0)[0];
+                float vy1 = (float) sample.line1.get(1, 0)[0];
+                float x01 = (float) sample.line1.get(2, 0)[0];
+                float y01 = (float) sample.line1.get(3, 0)[0];
+
+                float line1_start_x = (x01 - vx1 * 50) * scaleBmpPxToCanvasPx;
+                float line1_start_y = (y01 - vy1 * 50) * scaleBmpPxToCanvasPx;
+                float line1_end_x = (x01 + vx1 * 50) * scaleBmpPxToCanvasPx;
+                float line1_end_y = (y01 + vy1 * 50) * scaleBmpPxToCanvasPx;
+                canvas.drawLine(line1_start_x, line1_start_y, line1_end_x, line1_end_y, linePaint);
+
+                // Line 2
+                float vx2 = (float) sample.line2.get(0, 0)[0];
+                float vy2 = (float) sample.line2.get(1, 0)[0];
+                float x02 = (float) sample.line2.get(2, 0)[0];
+                float y02 = (float) sample.line2.get(3, 0)[0];
+
+                float line2_start_x = (x02 - vx2 * 50) * scaleBmpPxToCanvasPx;
+                float line2_start_y = (y02 - vy2 * 50) * scaleBmpPxToCanvasPx;
+                float line2_end_x = (x02 + vx2 * 50) * scaleBmpPxToCanvasPx;
+                float line2_end_y = (y02 + vy2 * 50) * scaleBmpPxToCanvasPx;
+                canvas.drawLine(line2_start_x, line2_start_y, line2_end_x, line2_end_y, linePaint);
+            }
         }
     }
 
