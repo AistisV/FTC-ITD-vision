@@ -38,7 +38,8 @@ public class SampleDetectionPipeline implements VisionProcessor {
     }
 
     static class DetectedSample {
-        Point3 position;
+        Point3 position; // Origin corner
+        Point3 worldCenter;
         double yaw;
         List<Point> projectedCorners;
         Point projectedCenter;
@@ -70,7 +71,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
     public double approxPolyEpsilon = 0.005; // Used for approximating shape
 
     // Thresholds
-    public Scalar redLower = new Scalar(0, 170, 80); // Can change second and third
+    public Scalar redLower = new Scalar(0, 175, 80); // Can change second and third
     public Scalar redUpper = new Scalar(255, 255, 255);
     public Scalar yellowLower = new Scalar(0, 145, 0); // Can change second
     public Scalar yellowUpper = new Scalar(255, 255, 85); // Can change third
@@ -112,12 +113,12 @@ public class SampleDetectionPipeline implements VisionProcessor {
             detectedSamples.add(sample);
             telemetry.addData("Block Detected",
                     "X: %.1f cm, Y: %.1f cm, Yaw: %.1f deg",
-                    sample.position.x, sample.position.y, sample.yaw);
+                    sample.worldCenter.x, sample.worldCenter.y, sample.yaw);
 
             contour.release();
         }
 
-        cannyMat.copyTo(frame);
+//        cannyMat.copyTo(frame);
 
         telemetry.update();
         return detectedSamples;
@@ -241,6 +242,24 @@ public class SampleDetectionPipeline implements VisionProcessor {
             rvec.release(); R_z.release(); vec_to_corner_local.release(); rotated_vec.release();
         }
 
+        // Calculate the world coordinates of the block's center
+        if (block.position != null) {
+            Point3 localCenter = new Point3(BLOCK_LENGTH / 2.0, BLOCK_WIDTH / 2.0, 0);
+            Mat rvec = createRvec(block.yaw);
+            Mat R_z = new Mat();
+            Calib3d.Rodrigues(rvec, R_z);
+            Mat localCenterVec = new Mat(3, 1, CvType.CV_64FC1);
+            localCenterVec.put(0, 0, localCenter.x, localCenter.y, localCenter.z);
+            Mat rotatedCenterVec = new Mat();
+            Core.gemm(R_z, localCenterVec, 1.0, new Mat(), 0.0, rotatedCenterVec, 0);
+            block.worldCenter = new Point3(
+                    block.position.x + rotatedCenterVec.get(0, 0)[0],
+                    block.position.y + rotatedCenterVec.get(1, 0)[0],
+                    0
+            );
+            rvec.release(); R_z.release(); localCenterVec.release(); rotatedCenterVec.release();
+        }
+
         // Project the final pose to get corners for drawing
         projectPoseFeatures(block);
         return block;
@@ -297,7 +316,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         tvec.put(0,0,origin.x); tvec.put(1,0,origin.y); tvec.put(2,0,origin.z);
 
         // --- 2. Project Model and Score Against Canny Edges ---
-        List<Point> projectedPoints = projectModelPoints(rvec, tvec);
+        List<Point> projectedPoints = projectWorldPoints(rvec, tvec, getTopFaceModelPoints());
         if (projectedPoints.size() < 4) {
             rvec.release(); R_z.release(); tvec.release();
             return Double.MAX_VALUE;
@@ -323,33 +342,84 @@ public class SampleDetectionPipeline implements VisionProcessor {
         return cost;
     }
 
+    // Projects 3D world points to 2D image points.
+    private List<Point> projectWorldPoints(Mat objectWorldRvec, Mat objectWorldTvec, List<Point3> pointsToProject) {
+        // --- 1. Get Camera's Pose in World Coordinates (Extrinsics) ---
+        // Explicitly define all matrices with their size and type.
+        Mat rvec_cam_to_world = new Mat(3, 1, CvType.CV_64FC1);
+        Mat tvec_cam_to_world = new Mat(3, 1, CvType.CV_64FC1);
+        getStaticCameraPoseInWorld(rvec_cam_to_world, tvec_cam_to_world);
+        Mat R_cam_to_world = new Mat(3, 3, CvType.CV_64FC1);
+        Calib3d.Rodrigues(rvec_cam_to_world, R_cam_to_world);
+
+        // --- 2. Calculate the World-to-Camera Transformation ---
+        Mat R_world_to_cam = R_cam_to_world.t();
+        Mat tvec_world_to_cam = new Mat(3, 1, CvType.CV_64FC1);
+        Core.gemm(R_world_to_cam, tvec_cam_to_world, -1.0, new Mat(), 0.0, tvec_world_to_cam, 0);
+
+        // --- 3. Transform the Object's World Pose to be Camera-Relative ---
+        Mat R_obj_world = new Mat(3, 3, CvType.CV_64FC1);
+        Calib3d.Rodrigues(objectWorldRvec, R_obj_world);
+        Mat R_obj_cam_mat = new Mat(3, 3, CvType.CV_64FC1);
+        Core.gemm(R_world_to_cam, R_obj_world, 1.0, new Mat(), 0.0, R_obj_cam_mat, 0);
+        Mat rvec_obj_cam = new Mat(3, 1, CvType.CV_64FC1);
+        Calib3d.Rodrigues(R_obj_cam_mat, rvec_obj_cam);
+
+        Mat tvec_obj_cam = new Mat(3, 1, CvType.CV_64FC1);
+        Mat temp_t = new Mat(3, 1, CvType.CV_64FC1);
+        Core.gemm(R_world_to_cam, objectWorldTvec, 1.0, new Mat(), 0.0, temp_t, 0);
+        Core.add(temp_t, tvec_world_to_cam, tvec_obj_cam);
+
+        // --- 4. Project the points using the camera-relative pose ---
+        MatOfPoint3f pointsToProjectMat = new MatOfPoint3f(pointsToProject.toArray(new Point3[0]));
+        MatOfPoint2f projectedPoints = new MatOfPoint2f();
+        Calib3d.projectPoints(pointsToProjectMat, rvec_obj_cam, tvec_obj_cam, cameraMatrix, new MatOfDouble(distCoeffs), projectedPoints);
+
+        List<Point> resultList = projectedPoints.toList();
+
+        rvec_cam_to_world.release(); tvec_cam_to_world.release(); R_cam_to_world.release();
+        R_world_to_cam.release(); tvec_world_to_cam.release(); R_obj_world.release();
+        R_obj_cam_mat.release(); rvec_obj_cam.release(); tvec_obj_cam.release(); temp_t.release();
+        pointsToProjectMat.release(); projectedPoints.release();
+
+        return resultList;
+    }
+
     private void projectPoseFeatures(DetectedSample block) {
         if (block.position == null) return;
+        Mat rvec = createRvec(block.yaw);
+        Mat tvec = createTvec(block.position);
 
-        Mat rvec = new Mat(3, 1, CvType.CV_64FC1);
-        rvec.put(0,0,0); rvec.put(1,0,0); rvec.put(2,0, Math.toRadians(block.yaw));
-        Mat tvec = new Mat(3, 1, CvType.CV_64FC1);
-        tvec.put(0,0, block.position.x); tvec.put(1,0, block.position.y); tvec.put(2,0, block.position.z);
+        // Project the 4 corners using the helper
+        block.projectedCorners = projectWorldPoints(rvec, tvec, getTopFaceModelPoints());
 
-        block.projectedCorners = projectModelPoints(rvec, tvec);
-
+        // Project the center point using the same helper
         Point3 localCenter = new Point3(BLOCK_LENGTH / 2.0, BLOCK_WIDTH / 2.0, 0);
-
-        MatOfPoint3f centerPointMat = new MatOfPoint3f(localCenter);
-        MatOfPoint2f projectedCenterPoint = new MatOfPoint2f();
-        try {
-            Calib3d.projectPoints(centerPointMat, rvec, tvec, cameraMatrix, new MatOfDouble(distCoeffs), projectedCenterPoint);
-            if (projectedCenterPoint.rows() > 0) {
-                block.projectedCenter = projectedCenterPoint.toList().get(0);
-            }
-        } catch (Exception e) {
-            block.projectedCenter = null;
+        List<Point> projectedCenterList = projectWorldPoints(rvec, tvec, Arrays.asList(localCenter));
+        if (projectedCenterList != null && !projectedCenterList.isEmpty()) {
+            block.projectedCenter = projectedCenterList.get(0);
         }
 
         rvec.release();
         tvec.release();
-        centerPointMat.release();
-        projectedCenterPoint.release();
+    }
+
+    // Helper to create a rotation vector from a yaw angle in degrees
+    private Mat createRvec(double yawDegrees) {
+        Mat rvec = new Mat(3, 1, CvType.CV_64FC1);
+        rvec.put(0, 0, 0);
+        rvec.put(1, 0, 0);
+        rvec.put(2, 0, Math.toRadians(yawDegrees));
+        return rvec;
+    }
+
+    // Helper to create a translation vector from a 3D world point
+    private Mat createTvec(Point3 worldOrigin) {
+        Mat tvec = new Mat(3, 1, CvType.CV_64FC1);
+        tvec.put(0, 0, worldOrigin.x);
+        tvec.put(1, 0, worldOrigin.y);
+        tvec.put(2, 0, worldOrigin.z);
+        return tvec;
     }
 
     @SuppressWarnings("unchecked")
@@ -364,7 +434,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         paint.setStyle(Paint.Style.STROKE);
 
         Paint centerPaint = new Paint();
-        centerPaint.setColor(Color.YELLOW);
+        centerPaint.setColor(Color.BLACK);
         centerPaint.setStyle(Paint.Style.FILL);
 
         for (DetectedSample sample : samplesToDraw) {
@@ -384,7 +454,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
                     canvas.drawCircle(
                             (float) (sample.projectedCenter.x * scaleBmpPxToCanvasPx),
                             (float) (sample.projectedCenter.y * scaleBmpPxToCanvasPx),
-                            5 * scaleCanvasDensity, // 5 is the radius of the dot
+                            3 * scaleCanvasDensity, // 5 is the radius of the dot
                             centerPaint
                     );
                 }
@@ -404,68 +474,6 @@ public class SampleDetectionPipeline implements VisionProcessor {
         points.add(new Point3(BLOCK_LENGTH, BLOCK_WIDTH, 0));
         points.add(new Point3(0, BLOCK_WIDTH, 0));
         return points;
-    }
-
-    // Projects the 3D model points of the block onto the 2D image plane,
-    // given the block's world pose (rotation and translation in world coordinates).
-    public List<Point> projectModelPoints(Mat objectWorldRvec, Mat objectWorldTvec) {
-        // --- 1. Get Camera's Pose in World Coordinates (Extrinsics) ---
-        // This defines where the camera is and how it's oriented relative to the world origin.
-        Mat rvec_cam_to_world = new Mat(3, 1, CvType.CV_64FC1);
-        Mat tvec_cam_to_world = new Mat(3, 1, CvType.CV_64FC1);
-        getStaticCameraPoseInWorld(rvec_cam_to_world, tvec_cam_to_world);
-
-        // --- 2. Calculate Object's Pose Relative to the Camera ---
-        // OpenCV's projectPoints function needs the object's pose from the camera's point of view.
-        // This requires converting the object's world pose to a camera-relative pose.
-        // The transformation is: P_camera = R_world_to_cam * P_world + T_world_to_cam
-
-        // Convert camera's world rotation vector to a 3x3 rotation matrix.
-        Mat R_cam_to_world = new Mat(3, 3, CvType.CV_64FC1);
-        Calib3d.Rodrigues(rvec_cam_to_world, R_cam_to_world);
-
-        // To get the transformation from world to camera, we need the inverse rotation.
-        // For rotation matrices, the inverse is simply the transpose.
-        Mat R_world_to_cam = R_cam_to_world.t();
-
-        // The translation from world to camera is -R_world_to_cam * T_cam_in_world
-        Mat t_cam_in_world = tvec_cam_to_world;
-        Mat tvec_world_to_cam = new Mat(3, 1, CvType.CV_64FC1);
-        Core.gemm(R_world_to_cam, t_cam_in_world, -1.0, new Mat(), 0.0, tvec_world_to_cam, 0);
-
-        // Now, apply this world-to-camera transform to the object's pose.
-        // Rotation: R_obj_cam = R_world_to_cam * R_obj_world
-        Mat R_obj_world = new Mat(3, 3, CvType.CV_64FC1);
-        Calib3d.Rodrigues(objectWorldRvec, R_obj_world);
-        Mat R_obj_cam_mat = new Mat(3, 3, CvType.CV_64FC1);
-        Core.gemm(R_world_to_cam, R_obj_world, 1.0, new Mat(), 0.0, R_obj_cam_mat, 0);
-        Mat rvec_obj_cam = new Mat(3, 1, CvType.CV_64FC1);
-        Calib3d.Rodrigues(R_obj_cam_mat, rvec_obj_cam); // Convert back to Rodrigues vector for projectPoints
-
-        // Translation: T_obj_cam = (R_world_to_cam * T_obj_world) + T_world_to_cam
-        Mat tvec_obj_cam = new Mat(3, 1, CvType.CV_64FC1);
-        Mat temp_t = new Mat(3,1,CvType.CV_64FC1);
-        Core.gemm(R_world_to_cam, objectWorldTvec, 1.0, new Mat(), 0.0, temp_t, 0);
-        Core.add(temp_t, tvec_world_to_cam, tvec_obj_cam);
-
-        // --- 3. Perform the Final Projection ---
-        MatOfPoint3f modelPointsMat = new MatOfPoint3f(getTopFaceModelPoints().toArray(new Point3[0]));
-        MatOfPoint2f projectedPoints = new MatOfPoint2f();
-        try {
-            Calib3d.projectPoints(modelPointsMat, rvec_obj_cam, tvec_obj_cam, cameraMatrix, new MatOfDouble(distCoeffs), projectedPoints);
-        } catch (Exception e) {
-            // Return empty list on failure
-            return new ArrayList<>();
-        }
-
-        List<Point> projectedPointsList = projectedPoints.toList();
-
-        rvec_cam_to_world.release(); tvec_cam_to_world.release(); R_cam_to_world.release();
-        R_world_to_cam.release(); tvec_world_to_cam.release(); R_obj_world.release();
-        rvec_obj_cam.release(); R_obj_cam_mat.release(); tvec_obj_cam.release(); temp_t.release();
-        modelPointsMat.release(); projectedPoints.release();
-
-        return projectedPointsList;
     }
 
     // Calculates the real-world 3D coordinates on the ground plane (Z=0)
@@ -566,16 +574,19 @@ public class SampleDetectionPipeline implements VisionProcessor {
     //Defines the camera's static position and orientation in the world.
     private void getStaticCameraPoseInWorld(Mat rvec_cam_to_world, Mat tvec_cam_to_world) {
         // The camera is at (0, 0, height) in world coordinates.
-        tvec_cam_to_world.put(0, 0, new double[]{0, 0, cameraHeight});
+        tvec_cam_to_world.put(0, 0, 0, 0, cameraHeight);
 
         // The camera is tilted down, which is a rotation around the world's X-axis.
         double angleRad = Math.toRadians(cameraDownAngle);
         Mat R_x = new Mat(3, 3, CvType.CV_64FC1);
-        R_x.put(0, 0, new double[]{1, 0, 0, 0, Math.cos(angleRad), -Math.sin(angleRad), 0, Math.sin(angleRad), Math.cos(angleRad)});
+        R_x.put(0, 0,
+                1, 0, 0,
+                0, Math.cos(angleRad), -Math.sin(angleRad),
+                0, Math.sin(angleRad), Math.cos(angleRad)
+        );
 
         // Convert the 3x3 rotation matrix to a 3x1 Rodrigues vector for use in other functions.
         Calib3d.Rodrigues(R_x, rvec_cam_to_world);
         R_x.release();
     }
-
 }
