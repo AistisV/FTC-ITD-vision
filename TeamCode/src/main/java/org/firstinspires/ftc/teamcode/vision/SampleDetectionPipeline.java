@@ -24,6 +24,7 @@ import org.opencv.imgproc.Imgproc;
 import org.opencv.imgproc.Moments;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 public class SampleDetectionPipeline implements VisionProcessor {
@@ -39,8 +40,10 @@ public class SampleDetectionPipeline implements VisionProcessor {
     }
 
     private enum Hypothesis {
-        HYPOTHESIS_A, // worldTopPoint corresponds to model_corner_A ((0,0,0) local)
-        HYPOTHESIS_B  // worldTopPoint corresponds to model_corner_B ((BLOCK_LENGTH, 0, 0) local)
+        HYPOTHESIS_A, // worldTopPoint corresponds to model corner (0, 0, 0)
+        HYPOTHESIS_B, // worldTopPoint corresponds to model corner (L, 0, 0)
+        HYPOTHESIS_C, // worldTopPoint corresponds to model corner (L, W, 0)
+        HYPOTHESIS_D  // worldTopPoint corresponds to model corner (0, W, 0)
     }
 
     static class AnalyzedSample {
@@ -61,7 +64,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
     Mat morphedThresholdMat = new Mat();
     Mat maskedColorMat = new Mat();
     Mat visualizationMat = new Mat();
-    Mat distTransformMat = new Mat();
+    Mat cannyMat = new Mat();
 
     Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
 
@@ -76,10 +79,10 @@ public class SampleDetectionPipeline implements VisionProcessor {
     private final double BLOCK_WIDTH = 3.7; // In CM
     private final double BLOCK_LENGTH = 8.7; // In CM
 
-    public double approxPolyEpsilon = 0.02;
+    public double approxPolyEpsilon = 0.005;
 
     // Threshold values
-    public Scalar redLower = new Scalar(0, 180, 80); // Can change second and third
+    public Scalar redLower = new Scalar(0, 175, 80); // Can change second and third
     public Scalar redUpper = new Scalar(255, 255, 255);
     public Scalar yellowLower = new Scalar(0, 145, 0); // Can change second
     public Scalar yellowUpper = new Scalar(255, 255, 85); // Can change third
@@ -199,7 +202,6 @@ public class SampleDetectionPipeline implements VisionProcessor {
         telemetry.addData("Cam World tvec (X,Y,Z)", String.format("%.2f, %.2f, %.2f", tvec_cam_to_world.get(0,0)[0], tvec_cam_to_world.get(1,0)[0], tvec_cam_to_world.get(2,0)[0]));
         telemetry.addData("Obj Cam tvec (X,Y,Z)", String.format("%.2f, %.2f, %.2f", tvec_obj_cam.get(0,0)[0], tvec_obj_cam.get(1,0)[0], tvec_obj_cam.get(2,0)[0]));
 
-
         List<Point3> modelPoints = getTopFaceModelPoints(); // Uses the block's model
 
         if (modelPoints.isEmpty()) {
@@ -315,25 +317,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         ArrayList<AnalyzedSample> detectedSamples = new ArrayList<>();
         findContours(frame, detectedSamples);
 
-        // --- START DEBUGGING VISUALIZATION ---
-        // This will overwrite the main camera feed with a view of the distance transform.
-        // Bright areas are "good" (high cost value), dark areas are "bad".
-        if (!distTransformMat.empty()) {
-            Mat dtVis = new Mat();
-            // Normalize the distance transform to a 0-255 range for visualization
-            Core.normalize(distTransformMat, dtVis, 0, 255, Core.NORM_MINMAX);
-            dtVis.convertTo(dtVis, CvType.CV_8UC1);
-
-            // Convert the grayscale visualization to color so it can be drawn on the frame
-            Imgproc.cvtColor(dtVis, dtVis, Imgproc.COLOR_GRAY2RGB);
-
-            // Copy the visualization to the output frame.
-            dtVis.copyTo(frame);
-            dtVis.release();
-        }
-        // --- END DEBUGGING VISUALIZATION ---
-
-//        morphedThresholdMat.copyTo(frame);
+        thresholdMat.copyTo(frame);
 
         if (!detectedSamples.isEmpty()) {
             for (AnalyzedSample sample : detectedSamples) {
@@ -365,13 +349,11 @@ public class SampleDetectionPipeline implements VisionProcessor {
         Imgproc.morphologyEx(thresholdMat, morphedThresholdMat, Imgproc.MORPH_CLOSE, kernel, new Point(-1, -1), 2);
         Imgproc.morphologyEx(morphedThresholdMat, morphedThresholdMat, Imgproc.MORPH_OPEN, kernel, new Point(-1, -1), 1);
 
-//        // Canny edge detection
-//        maskedColorMat.release();
-//        Core.bitwise_and(input, input, maskedColorMat, morphedThresholdMat);
-//        Imgproc.Canny(maskedColorMat, cannyMat, 500, 500, 3, true);
-//        Imgproc.dilate(cannyMat, cannyMat, kernel, new Point(-1, -1), 0);
+        maskedColorMat.release();
+        Core.bitwise_and(input, input, maskedColorMat, morphedThresholdMat);
+        Imgproc.Canny(maskedColorMat, cannyMat, 50, 150, 3, true);
+        Imgproc.dilate(cannyMat, cannyMat, kernel, new Point(-1, -1), 1);
 
-        Imgproc.distanceTransform(morphedThresholdMat, distTransformMat, Imgproc.DIST_L2, Imgproc.DIST_MASK_5);
         ArrayList<MatOfPoint> contoursList = new ArrayList<>();
         Imgproc.findContours(morphedThresholdMat, contoursList, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
 
@@ -562,13 +544,12 @@ public class SampleDetectionPipeline implements VisionProcessor {
     }
 
     private double calculatePoseCost(Point3 worldTopPointObserved, double yawDegrees, Hypothesis hypothesis) {
+        // --- 1. Create the Pose for this Hypothesis (Same logic as before) ---
         List<Point3> modelPoints = getTopFaceModelPoints();
         Point3 model_corner_B = modelPoints.get(1);
 
         Mat rvec_object_world = new Mat(3, 1, CvType.CV_64FC1);
         Mat tvec_object_world = new Mat(3, 1, CvType.CV_64FC1);
-
-        // 1. Create the 3x3 rotation matrix (R_z) and its rvec equivalent
         double yawRadians = Math.toRadians(yawDegrees);
         Mat R_z = new Mat(3, 3, CvType.CV_64FC1);
         R_z.put(0, 0, Math.cos(yawRadians)); R_z.put(0, 1, -Math.sin(yawRadians)); R_z.put(0, 2, 0);
@@ -576,67 +557,91 @@ public class SampleDetectionPipeline implements VisionProcessor {
         R_z.put(2, 0, 0);                   R_z.put(2, 1, 0);                   R_z.put(2, 2, 1);
         Calib3d.Rodrigues(R_z, rvec_object_world);
 
-        // 2. Calculate the model's world origin based on the hypothesis
         Point3 current_model_origin_world;
-        if (hypothesis == Hypothesis.HYPOTHESIS_A) {
-            current_model_origin_world = worldTopPointObserved;
-        } else { // HYPOTHESIS_B
-            Mat vec_origin_to_corner_B_local = new Mat(3, 1, CvType.CV_64FC1);
-            vec_origin_to_corner_B_local.put(0, 0, model_corner_B.x);
-            vec_origin_to_corner_B_local.put(1, 0, model_corner_B.y);
-            vec_origin_to_corner_B_local.put(2, 0, model_corner_B.z);
+        // Get all four model corner points
+        Point3 pA = modelPoints.get(0); // (0,0,0)
+        Point3 pB = modelPoints.get(1); // (L,0,0)
+        Point3 pC = modelPoints.get(2); // (L,W,0)
+        Point3 pD = modelPoints.get(3); // (0,W,0)
 
-            Mat rotated_vec_origin_to_corner_B_world = new Mat(3, 1, CvType.CV_64FC1);
-            // CORRECTED: Use the 3x3 rotation matrix R_z for rotation
-            Core.gemm(R_z, vec_origin_to_corner_B_local, 1.0, new Mat(), 0.0, rotated_vec_origin_to_corner_B_world, 0);
+        Point3 modelCorner;
+        switch (hypothesis) {
+            case HYPOTHESIS_A:
+            default:
+                modelCorner = pA;
+                break;
+            case HYPOTHESIS_B:
+                modelCorner = pB;
+                break;
+            case HYPOTHESIS_C:
+                modelCorner = pC;
+                break;
+            case HYPOTHESIS_D:
+                modelCorner = pD;
+                break;
+        }
+
+        if (hypothesis == Hypothesis.HYPOTHESIS_A) {
+            // For hypothesis A, the origin is simply the corner itself.
+            current_model_origin_world = worldTopPointObserved;
+        } else {
+            // For B, C, and D, we subtract the rotated local corner vector.
+            Mat vec_to_corner_local = new Mat(3, 1, CvType.CV_64FC1);
+            vec_to_corner_local.put(0, 0, modelCorner.x);
+            vec_to_corner_local.put(1, 0, modelCorner.y);
+            vec_to_corner_local.put(2, 0, modelCorner.z);
+
+            Mat rotated_vec = new Mat(3, 1, CvType.CV_64FC1);
+            Core.gemm(R_z, vec_to_corner_local, 1.0, new Mat(), 0.0, rotated_vec, 0);
 
             current_model_origin_world = new Point3(
-                    worldTopPointObserved.x - rotated_vec_origin_to_corner_B_world.get(0, 0)[0],
-                    worldTopPointObserved.y - rotated_vec_origin_to_corner_B_world.get(1, 0)[0],
-                    0
-            );
+                    worldTopPointObserved.x - rotated_vec.get(0, 0)[0],
+                    worldTopPointObserved.y - rotated_vec.get(1, 0)[0],
+                    0);
 
-            vec_origin_to_corner_B_local.release();
-            rotated_vec_origin_to_corner_B_world.release();
+            vec_to_corner_local.release();
+            rotated_vec.release();
         }
+
         tvec_object_world.put(0, 0, current_model_origin_world.x);
         tvec_object_world.put(1, 0, current_model_origin_world.y);
         tvec_object_world.put(2, 0, 0);
 
-        // 3. CORRECTED: Project points using the public helper method
+        // --- 2. Project the Model to get a 2D Rectangle ---
         List<Point> projectedPoints = projectModelPoints(rvec_object_world, tvec_object_world);
+        if (projectedPoints.size() < 4) {
+            R_z.release(); rvec_object_world.release(); tvec_object_world.release();
+            return Double.MAX_VALUE; // Return high cost if projection fails
+        }
+        // --- 3. Create a mask containing ONLY the edges of our projected model ---
+        Mat modelEdgeMask = Mat.zeros(morphedThresholdMat.size(), CvType.CV_8UC1);
+        MatOfPoint projectedContour = new MatOfPoint(projectedPoints.toArray(new Point[0]));
+        // Draw the outline of the projected rectangle. The thickness makes it more robust to matching.
+        Imgproc.polylines(modelEdgeMask, Arrays.asList(projectedContour), true, new Scalar(255), 3);
 
-        // 4. Clean up Mats created in this function
-        R_z.release();
+        // --- 4. Calculate the Edge Alignment Score ---
+        Mat edgeIntersection = new Mat();
+        // Find the overlap between the REAL edges (from Canny) and our HYPOTHETICAL edges (from the projection)
+        Core.bitwise_and(this.cannyMat, modelEdgeMask, edgeIntersection);
+
+        double edgeIntersectionArea = Core.countNonZero(edgeIntersection);
+        double modelEdgeArea = Core.countNonZero(modelEdgeMask);
+
+        // The score is the fraction of the projected model's edge pixels that overlap with real Canny edges.
+        double edgeScore = (modelEdgeArea > 0) ? edgeIntersectionArea / modelEdgeArea : 0;
+
+        // --- 5. Final Cost ---
+        // We want to MAXIMIZE the edge alignment score, so the cost is its negative.
+        double cost = -edgeScore;
+
+        // --- 6. Clean up ---
+        // ... (Release all local Mat objects: rvec_object_world, tvec_object_world, modelEdgeMask, projectedContour, edgeIntersection, etc.)
+        R_z.release(); // from step 1
         rvec_object_world.release();
         tvec_object_world.release();
-
-        // --- 5. Calculate the cost using the Distance Transform map ---
-        double totalDtValue = 0;
-        int points_in_bounds = 0;
-        if (distTransformMat.empty() || distTransformMat.type() != CvType.CV_32FC1) {
-            telemetry.addData("Error", "Distance Transform Mat is not ready for cost calculation!");
-            return Double.MAX_VALUE;
-        }
-
-        int dt_cols = distTransformMat.cols();
-        int dt_rows = distTransformMat.rows();
-
-        for (Point p : projectedPoints) {
-            int px = (int) Math.round(p.x);
-            int py = (int) Math.round(p.y);
-            if (px >= 0 && px < dt_cols && py >= 0 && py < dt_rows) {
-                totalDtValue += distTransformMat.get(py, px)[0];
-                points_in_bounds++;
-            }
-        }
-
-        double cost;
-        if (points_in_bounds > 0) {
-            cost = -totalDtValue / points_in_bounds; // Average negative value
-        } else {
-            cost = Double.MAX_VALUE / 2; // High penalty if points are off-screen
-        }
+        projectedContour.release();
+        modelEdgeMask.release();
+        edgeIntersection.release();
 
         return cost;
     }
@@ -659,7 +664,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         telemetry.addData(String.format("YawOpt %s Start", hypothesis.name()), String.format("Yaw: 0.0, Cost: %.4f", minCost));
         // --- END DEBUGGING ---
 
-        double searchStepDegrees = 5.0; // Use a slightly larger step for debugging to reduce log spam
+        double searchStepDegrees = 2.0; // Use a slightly larger step for debugging to reduce log spam
 
         for (double currentYaw = searchStepDegrees; currentYaw < 180; currentYaw += searchStepDegrees) {
             double cost = calculatePoseCost(worldTopPointObserved, currentYaw, hypothesis);
@@ -691,92 +696,75 @@ public class SampleDetectionPipeline implements VisionProcessor {
      * @param sample The AnalyzedSample object to update with the optimal pose.
      * @return The updated AnalyzedSample with optimal pose information.
      */
+    // Add this flag to the top of your class
+    private static final boolean ENABLE_DEBUG_VIZ = true;
+
+    // Replace the entire estimateOptimalPoseForSample method
     private AnalyzedSample estimateOptimalPoseForSample(AnalyzedSample sample) {
-        if (sample.worldTopPoint == null || sample.topPoint2D == null) {
-            telemetry.addData("Error", "Sample worldTopPoint or topPoint2D is null for pose estimation.");
-            return sample;
-        }
+        if (sample.worldTopPoint == null) return sample;
 
+        double bestOverallCost = Double.MAX_VALUE;
+        Hypothesis bestHypothesis = null;
         double bestOverallYaw = 0;
-        Point3 final_optimalWorldOrigin = null; // This will store the ultimate (0,0,0) model origin
-        double minOverallCost = Double.MAX_VALUE;
 
-        // --- Hypothesis 1: worldTopPoint corresponds to model_corner_A ((0,0,0) local) ---
-        // findOptimalYaw will call calculatePoseCost, which handles the origin derivation
-        double H1_optimized_yaw = findOptimalYaw(sample.worldTopPoint, Hypothesis.HYPOTHESIS_A);
-        // Calculate cost one last time with optimal yaw for proper comparison
-        double H1_cost = calculatePoseCost(sample.worldTopPoint, H1_optimized_yaw, Hypothesis.HYPOTHESIS_A);
-        telemetry.addData("H1 Cost/Yaw", String.format("%.2f / %.2f", H1_cost, H1_optimized_yaw));
+        // Test all four hypotheses
+        for (Hypothesis hypothesis : Hypothesis.values()) {
+            double yaw = findOptimalYaw(sample.worldTopPoint, hypothesis);
+            double cost = calculatePoseCost(sample.worldTopPoint, yaw, hypothesis);
 
-        if (H1_cost < minOverallCost) {
-            minOverallCost = H1_cost;
-            bestOverallYaw = H1_optimized_yaw;
-            // If H1 wins, the model's (0,0,0) origin is directly at worldTopPoint
-            final_optimalWorldOrigin = sample.worldTopPoint;
+            telemetry.addData(String.format("Test %s", hypothesis.name()), String.format("Cost: %.3f, Yaw: %.1f", cost, yaw));
+
+            if (cost < bestOverallCost) {
+                bestOverallCost = cost;
+                bestHypothesis = hypothesis;
+                bestOverallYaw = yaw;
+            }
         }
 
-        // --- Hypothesis 2: worldTopPoint corresponds to model_corner_B ((BLOCK_LENGTH, 0, 0) local) ---
-        // findOptimalYaw will call calculatePoseCost, which handles the origin derivation for H2
-        double H2_optimized_yaw = findOptimalYaw(sample.worldTopPoint, Hypothesis.HYPOTHESIS_B);
-        // Calculate cost one last time with optimal yaw for proper comparison
-        double H2_cost = calculatePoseCost(sample.worldTopPoint, H2_optimized_yaw, Hypothesis.HYPOTHESIS_B);
-        telemetry.addData("H2 Cost/Yaw", String.format("%.2f / %.2f", H2_cost, H2_optimized_yaw));
-
-        if (H2_cost < minOverallCost) {
-            minOverallCost = H2_cost;
-            bestOverallYaw = H2_optimized_yaw;
-            // If H2 wins, the model's (0,0,0) origin needs to be calculated based on the H2_optimized_yaw
-            // This calculation is the same as performed inside calculatePoseCost for Hypothesis B.
-            // In the "if (H2_cost < minOverallCost)" block
-            List<Point3> modelPoints = getTopFaceModelPoints();
-            Point3 model_corner_B = modelPoints.get(1);
-
-            // CORRECTED: Create a 3x3 rotation matrix from the optimal yaw
-            double yawRad_H2 = Math.toRadians(H2_optimized_yaw);
-            Mat R_H2_optimal_mat = new Mat(3, 3, CvType.CV_64FC1);
-            R_H2_optimal_mat.put(0, 0, Math.cos(yawRad_H2)); R_H2_optimal_mat.put(0, 1, -Math.sin(yawRad_H2)); R_H2_optimal_mat.put(0, 2, 0);
-            R_H2_optimal_mat.put(1, 0, Math.sin(yawRad_H2)); R_H2_optimal_mat.put(1, 1, Math.cos(yawRad_H2));  R_H2_optimal_mat.put(1, 2, 0);
-            R_H2_optimal_mat.put(2, 0, 0);                   R_H2_optimal_mat.put(2, 1, 0);                   R_H2_optimal_mat.put(2, 2, 1);
-
-            Mat vec_origin_to_corner_B_local = new Mat(3, 1, CvType.CV_64FC1);
-            vec_origin_to_corner_B_local.put(0, 0, model_corner_B.x);
-            vec_origin_to_corner_B_local.put(1, 0, model_corner_B.y);
-            vec_origin_to_corner_B_local.put(2, 0, model_corner_B.z);
-
-            Mat rotated_vec_origin_to_corner_B_world = new Mat(3, 1, CvType.CV_64FC1);
-            // CORRECTED: Use the 3x3 matrix for rotation
-            Core.gemm(R_H2_optimal_mat, vec_origin_to_corner_B_local, 1.0, new Mat(), 0.0, rotated_vec_origin_to_corner_B_world, 0);
-
-            final_optimalWorldOrigin = new Point3(
-                    sample.worldTopPoint.x - rotated_vec_origin_to_corner_B_world.get(0, 0)[0],
-                    sample.worldTopPoint.y - rotated_vec_origin_to_corner_B_world.get(1, 0)[0],
-                    0 // Z remains 0
-            );
-
-            // Clean up all the Mats
-            R_H2_optimal_mat.release();
-            vec_origin_to_corner_B_local.release();
-            rotated_vec_origin_to_corner_B_world.release();
-        }
-
-        // Update the sample with the best found pose
-        if (final_optimalWorldOrigin != null) {
+        // Set the final pose based on the winning hypothesis
+        if (bestHypothesis != null) {
             sample.angle = bestOverallYaw;
-            sample.optimalWorldOrigin = final_optimalWorldOrigin; // Store the optimal model origin
 
-            telemetry.addData("Optimal Model Origin (X,Y)", String.format("%.2f, %.2f", final_optimalWorldOrigin.x, final_optimalWorldOrigin.y));
-            telemetry.addData("Optimal Yaw", String.format("%.2f degrees", bestOverallYaw));
-            telemetry.addData("Min Overall Cost", String.format("%.2f", minOverallCost));
-        } else {
-            telemetry.addData("Error", "Final optimal model origin is null after optimization.");
-            sample.optimalWorldOrigin = null; // Ensure null if no pose found
+            // Calculate the final origin based on the winning hypothesis and yaw
+            List<Point3> modelPoints = getTopFaceModelPoints();
+            Point3 winningCorner = modelPoints.get(bestHypothesis.ordinal());
+
+            if (bestHypothesis == Hypothesis.HYPOTHESIS_A) {
+                sample.optimalWorldOrigin = sample.worldTopPoint;
+            } else {
+                Mat rvec = createRvec(bestOverallYaw);
+                Mat R_z = new Mat();
+                Calib3d.Rodrigues(rvec, R_z);
+
+                Mat vec_to_corner_local = new Mat(3, 1, CvType.CV_64FC1);
+                vec_to_corner_local.put(0, 0, winningCorner.x);
+                vec_to_corner_local.put(1, 0, winningCorner.y);
+                vec_to_corner_local.put(2, 0, winningCorner.z);
+
+                Mat rotated_vec = new Mat(3, 1, CvType.CV_64FC1);
+                Core.gemm(R_z, vec_to_corner_local, 1.0, new Mat(), 0.0, rotated_vec, 0);
+
+                sample.optimalWorldOrigin = new Point3(
+                        sample.worldTopPoint.x - rotated_vec.get(0, 0)[0],
+                        sample.worldTopPoint.y - rotated_vec.get(1, 0)[0],
+                        0);
+
+                // Cleanup
+                rvec.release();
+                R_z.release();
+                vec_to_corner_local.release();
+                rotated_vec.release();
+            }
+
+            telemetry.addData("== WINNER ==", String.format("%s, Yaw: %.1f", bestHypothesis.name(), bestOverallYaw));
         }
 
-        // --- Final Projection: Project the model points using the determined optimal pose ---
+        // Final projection for visualization
         projectOptimalModelPointsForSample(sample);
 
         return sample;
     }
+
 
     @SuppressWarnings("unchecked")
     @Override
@@ -861,5 +849,56 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
         }
     }
+
+
+
+    // Helper to create a rotation vector from a yaw angle in degrees
+    private Mat createRvec(double yawDegrees) {
+        Mat rvec = new Mat(3, 1, CvType.CV_64FC1);
+        // OpenCV's Rodrigues function can take a simple Z-axis rotation vector
+        rvec.put(0, 0, 0);
+        rvec.put(1, 0, 0);
+        rvec.put(2, 0, Math.toRadians(yawDegrees));
+        return rvec;
+    }
+
+    // Helper to create a translation vector from a 3D world point
+    private Mat createTvec(Point3 worldOrigin) {
+        Mat tvec = new Mat(3, 1, CvType.CV_64FC1);
+        tvec.put(0, 0, worldOrigin.x);
+        tvec.put(1, 0, worldOrigin.y);
+        tvec.put(2, 0, worldOrigin.z);
+        return tvec;
+    }
+
+    // Helper to calculate the world origin for Hypothesis B
+    private Point3 calculateHypothesisBOrigin(Point3 worldCorner, double yawDegrees) {
+        Point3 model_corner_B = getTopFaceModelPoints().get(1);
+        Mat rvec = createRvec(yawDegrees);
+        Mat R_z = new Mat();
+        Calib3d.Rodrigues(rvec, R_z);
+
+        Mat vec_to_B_local = new Mat(3, 1, CvType.CV_64FC1);
+        vec_to_B_local.put(0, 0, model_corner_B.x);
+        vec_to_B_local.put(1, 0, model_corner_B.y);
+        vec_to_B_local.put(2, 0, model_corner_B.z);
+
+        Mat rotated_vec_to_B = new Mat(3, 1, CvType.CV_64FC1);
+        Core.gemm(R_z, vec_to_B_local, 1.0, new Mat(), 0.0, rotated_vec_to_B, 0);
+
+        Point3 origin = new Point3(
+                worldCorner.x - rotated_vec_to_B.get(0, 0)[0],
+                worldCorner.y - rotated_vec_to_B.get(1, 0)[0],
+                0);
+
+        // Cleanup
+        rvec.release();
+        R_z.release();
+        vec_to_B_local.release();
+        rotated_vec_to_B.release();
+
+        return origin;
+    }
+
 
 }
