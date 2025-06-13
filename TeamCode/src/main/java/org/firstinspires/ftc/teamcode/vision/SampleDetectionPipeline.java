@@ -29,6 +29,9 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
     public enum SelectedColor { RED, YELLOW, BLUE }
     SelectedColor selectedColor = SelectedColor.RED; // Default
+//    SelectedColor selectedColor = SelectedColor.YELLOW; // Default
+//    SelectedColor selectedColor = SelectedColor.BLUE; // Default
+
 
     private enum Hypothesis {
         HYPOTHESIS_A, // Anchor is corner (0, 0, 0)
@@ -55,9 +58,13 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
     Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
 
+    // world-to-camera transformation matrix
+    private Mat R_world_to_cam_inst;
+    private Mat tvec_world_to_cam_inst;
+
     // Camera parameters
-    public double cameraHeight = 26.7; // Height above the ground plane in CM
-    public double cameraDownAngle = 41; // Angle in degrees the camera points downwards (90 degrees is straight down)
+    public double cameraHeight = 25; // Height above the ground plane in CM
+    public double cameraDownAngle = 44; // Angle in degrees the camera points downwards (90 degrees is straight down)
     Mat cameraMatrix = new Mat(3, 3, CvType.CV_64FC1);
     Mat distCoeffs = new Mat(1, 5, CvType.CV_64FC1);
     private final int CALIBRATION_WIDTH = 2560;
@@ -71,7 +78,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
     public double approxPolyEpsilon = 0.005; // Used for approximating shape
 
     // Thresholds
-    public Scalar redLower = new Scalar(0, 175, 80); // Can change second and third
+    public Scalar redLower = new Scalar(0, 175, 90); // Can change second and third
     public Scalar redUpper = new Scalar(255, 255, 255);
     public Scalar yellowLower = new Scalar(0, 145, 0); // Can change second
     public Scalar yellowUpper = new Scalar(255, 255, 85); // Can change third
@@ -94,6 +101,22 @@ public class SampleDetectionPipeline implements VisionProcessor {
         double aspectRatio = (double) width / height;
         frameHeight = (int) (FRAME_WIDTH / aspectRatio);
         loadCameraCalibration();
+
+        // Pre-calculate the constant world-to-camera transformation
+        Mat rvec_cam_to_world = new Mat(3, 1, CvType.CV_64FC1);
+        Mat tvec_cam_to_world = new Mat(3, 1, CvType.CV_64FC1);
+        getStaticCameraPoseInWorld(rvec_cam_to_world, tvec_cam_to_world);
+
+        Mat R_cam_to_world = new Mat(3, 3, CvType.CV_64FC1);
+        Calib3d.Rodrigues(rvec_cam_to_world, R_cam_to_world);
+
+        this.R_world_to_cam_inst = R_cam_to_world.t();
+        this.tvec_world_to_cam_inst = new Mat(3, 1, CvType.CV_64FC1);
+        Core.gemm(this.R_world_to_cam_inst, tvec_cam_to_world, -1.0, new Mat(), 0.0, this.tvec_world_to_cam_inst, 0);
+
+        rvec_cam_to_world.release();
+        tvec_cam_to_world.release();
+        R_cam_to_world.release();
     }
 
     @Override
@@ -118,6 +141,8 @@ public class SampleDetectionPipeline implements VisionProcessor {
             contour.release();
         }
 
+//        Core.multiply(frame, new Scalar(0.5, 0.5, 0.5), frame);
+//        Core.addWeighted(frame, 0.7, maskedColorMat, 0.6, 0, frame);
 //        cannyMat.copyTo(frame);
 
         telemetry.update();
@@ -142,7 +167,8 @@ public class SampleDetectionPipeline implements VisionProcessor {
         maskedColorMat.release();
         Core.bitwise_and(input, input, maskedColorMat, morphedThresholdMat);
         Imgproc.Canny(maskedColorMat, cannyMat, 50, 150, 3, true);
-        Imgproc.dilate(cannyMat, cannyMat, kernel, new Point(-1, -1), 1);
+        Mat canyKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, new Size(3, 3));
+        Imgproc.dilate(cannyMat, cannyMat, canyKernel, new Point(-1, -1), 1);
 
         // Find contours
         ArrayList<MatOfPoint> contoursList = new ArrayList<>();
@@ -260,34 +286,53 @@ public class SampleDetectionPipeline implements VisionProcessor {
             rvec.release(); R_z.release(); localCenterVec.release(); rotatedCenterVec.release();
         }
 
-        // Project the final pose to get corners for drawing
         projectPoseFeatures(block);
         return block;
     }
 
     /**
      * Attempts to find the optimal yaw angle of the object by iteratively
-     * minimizing the cost function, given the observed worldTopPoint and a hypothesis.
-     * Performs a 180-degree grid search.
+     * minimizing the cost function, given the topPoint and a hypothesis.
      */
     private double findOptimalYaw(Point3 worldAnchorPoint, Hypothesis hypothesis) {
         double bestYaw = 0;
-        double minCost = calculatePoseCost(worldAnchorPoint, 0, hypothesis);
+        double minCost = Double.MAX_VALUE;
 
-        double searchStepDegrees = 2.0;
+        // Coarse Search
+        double coarseBestYaw = 0;
+        double coarseMinCost = calculatePoseCost(worldAnchorPoint, 0, hypothesis);
 
-        for (double currentYaw = searchStepDegrees; currentYaw < 180; currentYaw += searchStepDegrees) {
+        for (double currentYaw = 10; currentYaw < 180; currentYaw += 10) {
             double cost = calculatePoseCost(worldAnchorPoint, currentYaw, hypothesis);
-            if (cost < minCost) {
-                minCost = cost;
-                bestYaw = currentYaw;
+            if (cost < coarseMinCost) {
+                coarseMinCost = cost;
+                coarseBestYaw = currentYaw;
             }
         }
+
+        // Fine Search
+        double searchRadius = 15;
+        double fineStep = 2;
+        minCost = coarseMinCost;
+        bestYaw = coarseBestYaw;
+
+        for (double currentYaw = coarseBestYaw - searchRadius; currentYaw <= coarseBestYaw + searchRadius; currentYaw += fineStep) {
+            double normalizedYaw = currentYaw;
+            if (normalizedYaw < 0) normalizedYaw += 180;
+            if (normalizedYaw >= 180) normalizedYaw -= 180;
+
+            double cost = calculatePoseCost(worldAnchorPoint, normalizedYaw, hypothesis);
+            if (cost < minCost) {
+                minCost = cost;
+                bestYaw = normalizedYaw;
+            }
+        }
+
         return bestYaw;
     }
 
     private double calculatePoseCost(Point3 worldAnchorPoint, double yawDegrees, Hypothesis hypothesis) {
-        // --- 1. Construct Pose from Hypothesis ---
+        // Construct Pose from given hyphothesis
         List<Point3> modelPoints = getTopFaceModelPoints();
         Point3 origin;
         Mat rvec = new Mat(3, 1, CvType.CV_64FC1);
@@ -315,7 +360,7 @@ public class SampleDetectionPipeline implements VisionProcessor {
         Mat tvec = new Mat(3,1,CvType.CV_64FC1);
         tvec.put(0,0,origin.x); tvec.put(1,0,origin.y); tvec.put(2,0,origin.z);
 
-        // --- 2. Project Model and Score Against Canny Edges ---
+        // Project rectangle and compare against canny edge
         List<Point> projectedPoints = projectWorldPoints(rvec, tvec, getTopFaceModelPoints());
         if (projectedPoints.size() < 4) {
             rvec.release(); R_z.release(); tvec.release();
@@ -335,7 +380,6 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
         double cost = -edgeScore;
 
-        // --- 3. Cleanup ---
         rvec.release(); R_z.release(); tvec.release();
         projectedContour.release(); modelEdgeMask.release(); edgeIntersection.release();
 
@@ -344,42 +388,28 @@ public class SampleDetectionPipeline implements VisionProcessor {
 
     // Projects 3D world points to 2D image points.
     private List<Point> projectWorldPoints(Mat objectWorldRvec, Mat objectWorldTvec, List<Point3> pointsToProject) {
-        // --- 1. Get Camera's Pose in World Coordinates (Extrinsics) ---
-        // Explicitly define all matrices with their size and type.
-        Mat rvec_cam_to_world = new Mat(3, 1, CvType.CV_64FC1);
-        Mat tvec_cam_to_world = new Mat(3, 1, CvType.CV_64FC1);
-        getStaticCameraPoseInWorld(rvec_cam_to_world, tvec_cam_to_world);
-        Mat R_cam_to_world = new Mat(3, 3, CvType.CV_64FC1);
-        Calib3d.Rodrigues(rvec_cam_to_world, R_cam_to_world);
-
-        // --- 2. Calculate the World-to-Camera Transformation ---
-        Mat R_world_to_cam = R_cam_to_world.t();
-        Mat tvec_world_to_cam = new Mat(3, 1, CvType.CV_64FC1);
-        Core.gemm(R_world_to_cam, tvec_cam_to_world, -1.0, new Mat(), 0.0, tvec_world_to_cam, 0);
-
-        // --- 3. Transform the Object's World Pose to be Camera-Relative ---
+        // Transform Object's World Pose to be Camera-Relative
         Mat R_obj_world = new Mat(3, 3, CvType.CV_64FC1);
         Calib3d.Rodrigues(objectWorldRvec, R_obj_world);
         Mat R_obj_cam_mat = new Mat(3, 3, CvType.CV_64FC1);
-        Core.gemm(R_world_to_cam, R_obj_world, 1.0, new Mat(), 0.0, R_obj_cam_mat, 0);
+        Core.gemm(this.R_world_to_cam_inst, R_obj_world, 1.0, new Mat(), 0.0, R_obj_cam_mat, 0);
         Mat rvec_obj_cam = new Mat(3, 1, CvType.CV_64FC1);
         Calib3d.Rodrigues(R_obj_cam_mat, rvec_obj_cam);
 
         Mat tvec_obj_cam = new Mat(3, 1, CvType.CV_64FC1);
         Mat temp_t = new Mat(3, 1, CvType.CV_64FC1);
-        Core.gemm(R_world_to_cam, objectWorldTvec, 1.0, new Mat(), 0.0, temp_t, 0);
-        Core.add(temp_t, tvec_world_to_cam, tvec_obj_cam);
+        Core.gemm(this.R_world_to_cam_inst, objectWorldTvec, 1.0, new Mat(), 0.0, temp_t, 0);
+        Core.add(temp_t, this.tvec_world_to_cam_inst, tvec_obj_cam);
 
-        // --- 4. Project the points using the camera-relative pose ---
+        // Project points
         MatOfPoint3f pointsToProjectMat = new MatOfPoint3f(pointsToProject.toArray(new Point3[0]));
         MatOfPoint2f projectedPoints = new MatOfPoint2f();
         Calib3d.projectPoints(pointsToProjectMat, rvec_obj_cam, tvec_obj_cam, cameraMatrix, new MatOfDouble(distCoeffs), projectedPoints);
 
         List<Point> resultList = projectedPoints.toList();
 
-        rvec_cam_to_world.release(); tvec_cam_to_world.release(); R_cam_to_world.release();
-        R_world_to_cam.release(); tvec_world_to_cam.release(); R_obj_world.release();
-        R_obj_cam_mat.release(); rvec_obj_cam.release(); tvec_obj_cam.release(); temp_t.release();
+        R_obj_world.release(); R_obj_cam_mat.release(); rvec_obj_cam.release();
+        tvec_obj_cam.release(); temp_t.release();
         pointsToProjectMat.release(); projectedPoints.release();
 
         return resultList;
